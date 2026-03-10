@@ -1,0 +1,22 @@
+#!/bin/bash
+# start_root - OPTIONAL script that runs as root user in Docker container
+#
+# ⚠️  MOST PROJECTS DON'T NEED THIS SCRIPT!
+# The claude4ever system handles npm install and npm run dev automatically.
+#
+# Only customize this script if you need:
+# - Additional system packages (databases, tools)
+# - System-level configuration
+# - Custom root-level setup
+#
+# You can safely delete this file if you don't need custom root setup.
+
+echo "🔧 start_root: No custom root setup needed for this template"
+
+# Example: Install additional system packages
+# apt update && apt install -y postgresql-client redis-tools
+
+# Example: Set up system services
+# systemctl enable your-service
+
+echo "✅ start_root completed (no custom actions taken)"

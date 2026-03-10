@@ -1,0 +1,27 @@
+#!/bin/bash
+# start_user - OPTIONAL script that runs as claude user in Docker container
+#
+# ⚠️  MOST PROJECTS DON'T NEED THIS SCRIPT!
+# The claude4ever system handles npm install and npm run dev automatically.
+#
+# Only customize this script if you need:
+# - Database initialization/seeding
+# - Custom user-level setup
+# - Additional services to start
+# - Pre-application setup tasks
+#
+# You can safely delete this file if you don't need custom user setup.
+
+echo "👤 start_user: No custom user setup needed for this template"
+
+# Example: Initialize database
+# npm run db:migrate
+# npm run db:seed
+
+# Example: Set up additional services
+# redis-server --daemonize yes
+
+# Example: Custom environment setup
+# export CUSTOM_VAR=value
+
+echo "✅ start_user completed (no custom actions taken)"

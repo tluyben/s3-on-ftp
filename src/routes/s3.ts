@@ -9,6 +9,7 @@ import {
   buildListObjectsV2Xml,
   buildErrorXml,
 } from '../utils/xml.js';
+import { getEncryptionConfig, encryptData, decryptData } from '../utils/encryption.js';
 
 const router = Router();
 
@@ -141,7 +142,9 @@ router.head('/:bucket/*', (req: Request, res: Response) => {
 router.get('/:bucket/*', (req: Request, res: Response) => {
   const key = (req.params as Record<string, string>)['0'] ?? '';
   void withAdapter(res, req.params.bucket, async adapter => {
-    const data = await adapter.getObject(key);
+    const raw = await adapter.getObject(key);
+    const { privateKey } = getEncryptionConfig();
+    const data = privateKey ? decryptData(raw) : raw;
     res.set({
       'Content-Length': String(data.length),
       'Content-Type': 'application/octet-stream',
@@ -157,7 +160,10 @@ router.put('/:bucket/*', (req: Request, res: Response) => {
   const key = (req.params as Record<string, string>)['0'] ?? '';
   void withAdapter(res, req.params.bucket, async adapter => {
     const body = req.body as Buffer;
-    await adapter.putObject(key, body);
+    const { publicKey } = getEncryptionConfig();
+    const dataToStore = publicKey ? encryptData(body) : body;
+    await adapter.putObject(key, dataToStore);
+    // ETag is always of the original plaintext so clients can verify content
     const etag = createHash('md5').update(body).digest('hex');
     res.set('ETag', `"${etag}"`).status(200).end();
   });

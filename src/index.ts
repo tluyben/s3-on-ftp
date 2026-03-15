@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { readPort } from './utils/port.js';
+import { isEncryptionEnabled, getEncryptionConfig } from './utils/encryption.js';
 import s3Router from './routes/s3.js';
 
 const app = express();
@@ -38,6 +39,13 @@ app.use('/', s3Router);
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`S3 Protocol Proxy listening on http://0.0.0.0:${PORT}`);
+  if (isEncryptionEnabled()) {
+    const { publicKey, privateKey } = getEncryptionConfig();
+    console.log('');
+    console.log('Encryption:');
+    console.log(`  Encrypt on PUT : ${publicKey ? `yes (${process.env.PUBLIC_KEY})` : 'no (PUBLIC_KEY not set)'}`);
+    console.log(`  Decrypt on GET : ${privateKey ? `yes (${process.env.PRIVATE_KEY})` : 'no (PRIVATE_KEY not set)'}`);
+  }
   console.log('');
   console.log('Configure your S3 client:');
   console.log(`  Endpoint URL : http://localhost:${PORT}`);

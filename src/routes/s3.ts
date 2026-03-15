@@ -9,7 +9,7 @@ import {
   buildListObjectsV2Xml,
   buildErrorXml,
 } from '../utils/xml.js';
-import { getEncryptionConfig, encryptData, decryptData } from '../utils/encryption.js';
+import { getEncryptionConfig, encryptData, decryptData, keyFromHeader } from '../utils/encryption.js';
 
 const router = Router();
 
@@ -143,8 +143,9 @@ router.get('/:bucket/*', (req: Request, res: Response) => {
   const key = (req.params as Record<string, string>)['0'] ?? '';
   void withAdapter(res, req.params.bucket, async adapter => {
     const raw = await adapter.getObject(key);
-    const { privateKey } = getEncryptionConfig();
-    const data = privateKey ? decryptData(raw) : raw;
+    const headerVal = req.get('X-Enc-Private-Key');
+    const privKey = headerVal ? keyFromHeader(headerVal, 'private') : getEncryptionConfig().privateKey;
+    const data = privKey ? decryptData(raw, privKey) : raw;
     res.set({
       'Content-Length': String(data.length),
       'Content-Type': 'application/octet-stream',
@@ -160,8 +161,9 @@ router.put('/:bucket/*', (req: Request, res: Response) => {
   const key = (req.params as Record<string, string>)['0'] ?? '';
   void withAdapter(res, req.params.bucket, async adapter => {
     const body = req.body as Buffer;
-    const { publicKey } = getEncryptionConfig();
-    const dataToStore = publicKey ? encryptData(body) : body;
+    const headerVal = req.get('X-Enc-Public-Key');
+    const pubKey = headerVal ? keyFromHeader(headerVal, 'public') : getEncryptionConfig().publicKey;
+    const dataToStore = pubKey ? encryptData(body, pubKey) : body;
     await adapter.putObject(key, dataToStore);
     // ETag is always of the original plaintext so clients can verify content
     const etag = createHash('md5').update(body).digest('hex');

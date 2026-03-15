@@ -3,14 +3,20 @@ import { generateKeyPairSync } from 'crypto';
 import { writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { encryptData, decryptData, getEncryptionConfig, _resetCache } from '../src/utils/encryption.js';
+import { encryptData, decryptData, getEncryptionConfig, keyFromHeader, _resetCache } from '../src/utils/encryption.js';
 
 // Generate a fresh RSA key pair once for the whole test run
 const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const pubPath = join(tmpdir(), 'test_s3proxy_pub.pem');
 const privPath = join(tmpdir(), 'test_s3proxy_priv.pem');
-writeFileSync(pubPath, publicKey.export({ type: 'pkcs1', format: 'pem' }));
-writeFileSync(privPath, privateKey.export({ type: 'pkcs8', format: 'pem' }));
+const pubPem = publicKey.export({ type: 'pkcs1', format: 'pem' }) as string;
+const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' }) as string;
+writeFileSync(pubPath, pubPem);
+writeFileSync(privPath, privPem);
+
+// Header values: base64-encoded PEM (single-line, header-safe)
+const pubHeader = Buffer.from(pubPem).toString('base64');
+const privHeader = Buffer.from(privPem).toString('base64');
 
 describe('encryption utility', () => {
   const savedEnv: Record<string, string | undefined> = {};
@@ -89,5 +95,57 @@ describe('encryption utility', () => {
     const config = getEncryptionConfig();
     expect(config.publicKey).toBeNull();
     expect(config.privateKey).toBeNull();
+  });
+});
+
+describe('keyFromHeader + header-key round-trip', () => {
+  it('parses a base64-encoded public key from a header value', () => {
+    const key = keyFromHeader(pubHeader, 'public');
+    expect(key).not.toBeNull();
+  });
+
+  it('parses a base64-encoded private key from a header value', () => {
+    const key = keyFromHeader(privHeader, 'private');
+    expect(key).not.toBeNull();
+  });
+
+  it('round-trips using keys passed via header values (no env vars)', () => {
+    // env vars deliberately absent — keys come entirely from headers
+    delete process.env.PUBLIC_KEY;
+    delete process.env.PRIVATE_KEY;
+    _resetCache();
+
+    const pubKey = keyFromHeader(pubHeader, 'public');
+    const privKey = keyFromHeader(privHeader, 'private');
+
+    const original = Buffer.from('encrypted via header keys');
+    const ct = encryptData(original, pubKey);
+    const recovered = decryptData(ct, privKey);
+
+    expect(recovered.toString()).toBe(original.toString());
+  });
+
+  it('header key takes priority over env-var key', () => {
+    // Generate a second key pair — env vars point to the first pair
+    const { publicKey: pub2, privateKey: priv2 } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const pub2Header = Buffer.from(pub2.export({ type: 'pkcs1', format: 'pem' }) as string).toString('base64');
+    const priv2Header = Buffer.from(priv2.export({ type: 'pkcs8', format: 'pem' }) as string).toString('base64');
+
+    // Encrypt with header key (pair 2); env var still points to pair 1
+    const pubKey2 = keyFromHeader(pub2Header, 'public');
+    const privKey2 = keyFromHeader(priv2Header, 'private');
+
+    const original = Buffer.from('priority test');
+    const ct = encryptData(original, pubKey2);
+
+    // Decrypting with env-var key (pair 1) must fail
+    expect(() => decryptData(ct)).toThrow();
+
+    // Decrypting with header key (pair 2) must succeed
+    expect(decryptData(ct, privKey2).toString()).toBe(original.toString());
+  });
+
+  it('throws on invalid base64 / garbage header value', () => {
+    expect(() => keyFromHeader('not-valid-pem-base64!!!', 'public')).toThrow();
   });
 });

@@ -8,9 +8,16 @@
  *   [16 bytes] AES-GCM authentication tag
  *   [rest]     AES-256-GCM ciphertext
  *
- * Keys are loaded once at first call and cached for the process lifetime.
- * Set PUBLIC_KEY=/path/to/pub.pem  → encryption enabled on PUT
- * Set PRIVATE_KEY=/path/to/priv.pem → decryption enabled on GET
+ * Key resolution order (first wins):
+ *   1. keyOverride argument passed directly to encryptData / decryptData
+ *   2. PUBLIC_KEY / PRIVATE_KEY environment variables (file paths)
+ *
+ * Per-request key injection via HTTP headers:
+ *   X-Enc-Public-Key: <base64-encoded PEM>   →  encrypt on PUT
+ *   X-Enc-Private-Key: <base64-encoded PEM>  →  decrypt on GET
+ *
+ * AWS S3 silently ignores headers it does not recognise, so sending these
+ * headers to real S3 is a no-op and does not break anything.
  */
 
 import { readFileSync } from 'fs';
@@ -55,16 +62,30 @@ export function isEncryptionEnabled(): boolean {
   return !!(process.env.PUBLIC_KEY || process.env.PRIVATE_KEY);
 }
 
-/** Encrypt a buffer using the configured public key. Throws if PUBLIC_KEY is not set. */
-export function encryptData(plaintext: Buffer): Buffer {
-  const { publicKey } = getEncryptionConfig();
-  if (!publicKey) throw new Error('PUBLIC_KEY env var is not set — cannot encrypt');
+/**
+ * Parse a key from the value of X-Enc-Public-Key / X-Enc-Private-Key.
+ * The header value must be the PEM string base64-encoded (so it is a
+ * single-line, header-safe ASCII string).
+ */
+export function keyFromHeader(b64pem: string, type: 'public' | 'private'): KeyObject {
+  const pem = Buffer.from(b64pem, 'base64').toString('utf8');
+  return type === 'public' ? createPublicKey(pem) : createPrivateKey(pem);
+}
+
+/**
+ * Encrypt a buffer with RSA-OAEP + AES-256-GCM.
+ * Pass keyOverride to use a per-request key (from the X-Enc-Public-Key header);
+ * otherwise falls back to the PUBLIC_KEY env-var key.
+ */
+export function encryptData(plaintext: Buffer, keyOverride?: KeyObject): Buffer {
+  const key = keyOverride ?? getEncryptionConfig().publicKey;
+  if (!key) throw new Error('No public key available — set PUBLIC_KEY env var or send X-Enc-Public-Key header');
 
   const aesKey = randomBytes(32); // AES-256
   const iv = randomBytes(12);     // GCM standard nonce
 
   // Wrap the AES key with RSA-OAEP
-  const encryptedKey = publicEncrypt({ key: publicKey, oaepHash: 'sha256' }, aesKey);
+  const encryptedKey = publicEncrypt({ key, oaepHash: 'sha256' }, aesKey);
 
   const keyLenBuf = Buffer.alloc(4);
   keyLenBuf.writeUInt32BE(encryptedKey.length, 0);
@@ -77,10 +98,14 @@ export function encryptData(plaintext: Buffer): Buffer {
   return Buffer.concat([keyLenBuf, encryptedKey, iv, tag, ciphertext]);
 }
 
-/** Decrypt a buffer using the configured private key. Throws if PRIVATE_KEY is not set. */
-export function decryptData(data: Buffer): Buffer {
-  const { privateKey } = getEncryptionConfig();
-  if (!privateKey) throw new Error('PRIVATE_KEY env var is not set — cannot decrypt');
+/**
+ * Decrypt a buffer produced by encryptData.
+ * Pass keyOverride to use a per-request key (from the X-Enc-Private-Key header);
+ * otherwise falls back to the PRIVATE_KEY env-var key.
+ */
+export function decryptData(data: Buffer, keyOverride?: KeyObject): Buffer {
+  const key = keyOverride ?? getEncryptionConfig().privateKey;
+  if (!key) throw new Error('No private key available — set PRIVATE_KEY env var or send X-Enc-Private-Key header');
 
   let offset = 0;
 
@@ -99,7 +124,7 @@ export function decryptData(data: Buffer): Buffer {
   const ciphertext = data.subarray(offset);
 
   // Unwrap AES key
-  const aesKey = privateDecrypt({ key: privateKey, oaepHash: 'sha256' }, encryptedKey);
+  const aesKey = privateDecrypt({ key, oaepHash: 'sha256' }, encryptedKey);
 
   // Decrypt with AES-256-GCM (tag is verified automatically; throws on tamper)
   const decipher = createDecipheriv('aes-256-gcm', aesKey, iv);

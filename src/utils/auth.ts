@@ -5,6 +5,7 @@ export interface ParsedAccessKey {
   username: string;
   host: string;
   port: number;
+  maxConnections?: number;
 }
 
 /**
@@ -55,5 +56,8 @@ export function parseAccessKeyUri(accessKey: string): ParsedAccessKey {
     throw new Error(`Access Key URI must include a hostname: ${accessKey}`);
   }
 
-  return { scheme, username, host: parsed.hostname, port };
+  const maxConnectionsParam = parsed.searchParams.get('maxConnections');
+  const maxConnections = maxConnectionsParam !== null ? parseInt(maxConnectionsParam, 10) : undefined;
+
+  return { scheme, username, host: parsed.hostname, port, maxConnections };
 }

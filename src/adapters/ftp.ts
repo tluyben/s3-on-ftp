@@ -5,7 +5,7 @@ import type { FileEntry, ObjectMeta } from '../types/backend.js';
 import { BaseAdapter } from './base.js';
 
 export class FtpAdapter extends BaseAdapter {
-  private readonly client = new Client();
+  private client = new Client();
 
   /** Always return absolute FTP paths to avoid CWD-relative issues. */
   protected override remotePath(key?: string): string {
@@ -91,5 +91,15 @@ export class FtpAdapter extends BaseAdapter {
 
   async disconnect(): Promise<void> {
     this.client.close();
+  }
+
+  isClosed(): boolean {
+    return this.client.closed;
+  }
+
+  async keepAlive(): Promise<void> {
+    if (!this.client.closed) {
+      await this.client.send('NOOP');
+    }
   }
 }

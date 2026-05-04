@@ -1,9 +1,13 @@
 import type { BackendAdapter, BackendCredentials, FileEntry, ObjectMeta } from '../types/backend.js';
 
 export abstract class BaseAdapter implements BackendAdapter {
-  constructor(protected readonly creds: BackendCredentials) {}
+  constructor(protected creds: BackendCredentials) {}
 
   abstract connect(): Promise<void>;
+
+  useBucket(bucket: string): void {
+    this.creds = { ...this.creds, bucket };
+  }
   abstract listObjects(prefix?: string): Promise<FileEntry[]>;
   abstract getObject(key: string): Promise<Buffer>;
   abstract putObject(key: string, data: Buffer): Promise<void>;

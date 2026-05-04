@@ -7,25 +7,35 @@ import { BaseAdapter } from './base.js';
 export class SftpAdapter extends BaseAdapter {
   protected conn = new Client();
   protected sftp!: SFTPWrapper;
+  private _connected = false;
+
+  isConnected(): boolean {
+    return this._connected;
+  }
 
   async connect(): Promise<void> {
+    this.conn = new Client();
+    this._connected = false;
     return new Promise((resolve, reject) => {
       this.conn
         .on('ready', () => {
           this.conn.sftp((err, sftp) => {
             if (err) return reject(err);
             this.sftp = sftp;
+            this._connected = true;
             resolve();
           });
         })
         .on('error', reject)
+        .on('close', () => { this._connected = false; })
         .connect({
           host: this.creds.host,
           port: this.creds.port,
           username: this.creds.username,
           password: this.creds.password,
-          // Accept any host key for local/testing use
           hostVerifier: () => true,
+          keepaliveInterval: 30_000,
+          keepaliveCountMax: 5,
         });
     });
   }
@@ -103,6 +113,7 @@ export class SftpAdapter extends BaseAdapter {
   }
 
   async disconnect(): Promise<void> {
+    this._connected = false;
     try { this.sftp.end(); } catch { /* ignore */ }
     this.conn.end();
   }

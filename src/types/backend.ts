@@ -7,6 +7,7 @@ export interface BackendCredentials {
   port: number;
   password: string;
   bucket: string;
+  maxConnections?: number;
 }
 
 export interface FileEntry {

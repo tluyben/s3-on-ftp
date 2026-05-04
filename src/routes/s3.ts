@@ -1,7 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { createHash } from 'crypto';
 import { parseCredentials } from '../middleware/parseCredentials.js';
-import { getAdapter } from '../adapters/factory.js';
+import { acquireConnection } from '../utils/connectionPool.js';
 import type { BackendAdapter, BackendCredentials } from '../types/backend.js';
 import {
   buildListBucketsXml,
@@ -34,14 +34,15 @@ async function withAdapter(
   bucket: string,
   fn: (adapter: BackendAdapter) => Promise<void>,
 ): Promise<void> {
-  const baseCreds = requireCreds(res);
-  if (!baseCreds) return;
+  const reqCreds = requireCreds(res);
+  if (!reqCreds) return;
 
-  const creds: BackendCredentials = { ...baseCreds, bucket };
-  let adapter: BackendAdapter | null = null;
+  const creds: BackendCredentials = { ...reqCreds, bucket };
+  let release: (() => void) | null = null;
   try {
-    adapter = await getAdapter(creds);
-    await fn(adapter);
+    const handle = await acquireConnection(creds);
+    release = handle.release;
+    await fn(handle.adapter);
   } catch (err) {
     if (res.headersSent) return;
     const msg = err instanceof Error ? err.message : String(err);
@@ -60,9 +61,7 @@ async function withAdapter(
       res.status(500).type('application/xml').send(buildErrorXml('InternalError', msg));
     }
   } finally {
-    if (adapter) {
-      await adapter.disconnect().catch(() => { /* ignore disconnect errors */ });
-    }
+    release?.();
   }
 }
 

@@ -1,8 +1,20 @@
 import { Client } from 'ssh2';
 import type { SFTPWrapper, FileEntry as Ssh2FileEntry } from 'ssh2';
 import { createHash } from 'crypto';
+import type { Readable, Writable } from 'stream';
+import { pipeline } from 'stream/promises';
 import type { FileEntry, ObjectMeta } from '../types/backend.js';
 import { BaseAdapter } from './base.js';
+
+/** Safety net against pathological trees; real buckets are far shallower. */
+const MAX_LIST_DEPTH = 32;
+
+/**
+ * Per-chunk transfer size. SFTP reads/writes are request-response per packet,
+ * so a larger window than the 64 KB stream default meaningfully improves
+ * throughput on high-latency links without holding the object in memory.
+ */
+const STREAM_CHUNK_SIZE = 256 * 1024;
 
 export class SftpAdapter extends BaseAdapter {
   protected conn = new Client();
@@ -40,45 +52,89 @@ export class SftpAdapter extends BaseAdapter {
     });
   }
 
+  private readdir(dir: string): Promise<Ssh2FileEntry[]> {
+    return new Promise((resolve, reject) => {
+      this.sftp.readdir(dir, (err, list) => (err ? reject(err) : resolve(list as Ssh2FileEntry[])));
+    });
+  }
+
+  /**
+   * Recursively collect every regular file under `dir`, keyed by its path
+   * relative to the bucket. S3 has no directories — a nested file is just a key
+   * containing slashes — so a non-recursive listing would hide most objects.
+   */
+  private async walk(dir: string, keyPrefix: string, depth: number): Promise<FileEntry[]> {
+    if (depth > MAX_LIST_DEPTH) return [];
+
+    const list = await this.readdir(dir);
+    const entries: FileEntry[] = [];
+
+    for (const f of list) {
+      // Many SFTP servers include '.' and '..'; recursing into them never ends.
+      if (f.filename === '.' || f.filename === '..') continue;
+
+      const key = keyPrefix ? `${keyPrefix}/${f.filename}` : f.filename;
+      const mode = f.attrs.mode ?? 0;
+      const type = mode & 0o170000;
+
+      if (type === 0o100000) {
+        entries.push({
+          key,
+          size: f.attrs.size ?? 0,
+          lastModified: new Date((f.attrs.mtime ?? 0) * 1000),
+          etag: createHash('md5').update(`${f.filename}${f.attrs.size ?? 0}`).digest('hex'),
+        });
+      } else if (type === 0o040000) {
+        // Symlinks (0o120000) are deliberately not followed — they can form cycles.
+        entries.push(...await this.walk(`${dir}/${f.filename}`, key, depth + 1));
+      }
+    }
+
+    return entries;
+  }
+
   async listObjects(prefix = ''): Promise<FileEntry[]> {
     const dir = prefix ? this.remotePath(prefix) : this.remotePath();
-    return new Promise((resolve, reject) => {
-      this.sftp.readdir(dir, (err, list) => {
-        if (err) return reject(err);
-        const entries: FileEntry[] = (list as Ssh2FileEntry[])
-          .filter(f => {
-            // Regular file: mode & 0o170000 === 0o100000
-            const mode = f.attrs.mode ?? 0;
-            return (mode & 0o170000) === 0o100000;
-          })
-          .map(f => ({
-            key: prefix ? `${prefix}/${f.filename}` : f.filename,
-            size: f.attrs.size ?? 0,
-            lastModified: new Date((f.attrs.mtime ?? 0) * 1000),
-            etag: createHash('md5').update(`${f.filename}${f.attrs.size ?? 0}`).digest('hex'),
-          }));
-        resolve(entries);
+    return this.walk(dir, prefix, 0);
+  }
+
+  /** Streams the remote file straight into `dest` — nothing is buffered. */
+  async downloadTo(key: string, dest: Writable): Promise<void> {
+    const source = this.sftp.createReadStream(this.remotePath(key), {
+      highWaterMark: STREAM_CHUNK_SIZE,
+    });
+    await pipeline(source, dest);
+  }
+
+  /**
+   * `mkdir -p` over SFTP. S3 keys are flat strings, so `a/b/c.txt` implies
+   * directories the backend does not create on its own. Per-level errors are
+   * ignored (EEXIST, or a concurrent writer winning the race) — a genuinely
+   * unwritable path surfaces when the file write itself fails.
+   */
+  private async mkdirp(dir: string): Promise<void> {
+    const absolute = dir.startsWith('/');
+    const parts = dir.split('/').filter(Boolean);
+    let cur = '';
+    for (const part of parts) {
+      cur = cur ? `${cur}/${part}` : (absolute ? `/${part}` : part);
+      const path = cur;
+      await new Promise<void>(resolve => {
+        this.sftp.mkdir(path, () => resolve());
       });
-    });
+    }
   }
 
-  async getObject(key: string): Promise<Buffer> {
-    return new Promise((resolve, reject) => {
-      const stream = this.sftp.createReadStream(this.remotePath(key));
-      const chunks: Buffer[] = [];
-      stream.on('data', (chunk: Buffer) => chunks.push(chunk));
-      stream.on('end', () => resolve(Buffer.concat(chunks)));
-      stream.on('error', reject);
+  /** Streams `src` straight to the remote file — nothing is buffered. */
+  async uploadFrom(key: string, src: Readable): Promise<void> {
+    if (key.includes('/')) {
+      const full = this.remotePath(key);
+      await this.mkdirp(full.slice(0, full.lastIndexOf('/')));
+    }
+    const dest = this.sftp.createWriteStream(this.remotePath(key), {
+      highWaterMark: STREAM_CHUNK_SIZE,
     });
-  }
-
-  async putObject(key: string, data: Buffer): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const stream = this.sftp.createWriteStream(this.remotePath(key));
-      stream.on('close', resolve);
-      stream.on('error', reject);
-      stream.end(data);
-    });
+    await pipeline(src, dest);
   }
 
   async deleteObject(key: string): Promise<void> {

@@ -114,6 +114,21 @@ aws --profile s3proxy --endpoint-url http://localhost:3001 s3 ls s3://backups/
 
 The proxy can encrypt objects before writing them to the backend and decrypt them on read-back. Encryption is **hybrid RSA + AES-256-GCM**: a fresh AES-256 key is generated per object, encrypted with your RSA public key, and stored alongside the ciphertext. The private key is only needed for reads.
 
+### Wire format (putfile-cloud compatible)
+
+```
+[4 bytes ] big-endian uint32 — length of the RSA-wrapped AES key
+[N bytes ] RSA-OAEP(SHA-256) encrypted AES-256 key
+[12 bytes] AES-GCM IV
+[rest    ] AES-256-GCM ciphertext, 16-byte auth tag APPENDED
+```
+
+This is byte-identical to putfile-cloud's format (`src/lib/crypto/encryption.ts`
+and `src/lib/sync-core/crypto.ts`), so objects written by this proxy decrypt
+with any putfile client and vice versa. The auth tag trails the ciphertext
+because WebCrypto's AES-GCM requires it there. `tests/crypto-compat.test.ts`
+pins this in both directions.
+
 ### Key resolution order (first wins per request)
 
 | Priority | Source | Header / Env var |
@@ -192,9 +207,10 @@ openssl rsa -in priv.pem -pubout -out pub.pem
 
 ### Notes
 
-- The ETag returned to the client is always the MD5 of the **original plaintext**, so client-side integrity checks continue to work.
+- `PutObject` returns an ETag that is the MD5 of the **original plaintext**, computed as the body streams past.
+- `GetObject` returns the same ETag as `HeadObject`/`ListObjects` (derived from name and stored size). The plaintext MD5 cannot be reported on a read without buffering the whole object, which streaming exists to avoid.
 - Objects stored while encryption was disabled are returned as-is (no decryption attempted unless a key is supplied).
-- `HeadObject` reports the size of the **stored** (encrypted) object; this may differ from the plaintext size.
+- `HeadObject` reports the size of the **stored** (encrypted) object; `GetObject` reports the plaintext length in `Content-Length`.
 
 ## Why Session Token for Password?
 
@@ -212,13 +228,16 @@ The S3 Secret Key is used only to compute an HMAC signature — it is **never tr
 
 ```
 src/
-├── index.ts              # Main server
+├── index.ts              # Entry point: reads the port and starts listening
+├── app.ts                # Express app construction (importable by tests)
 ├── types/backend.ts      # BackendCredentials, FileEntry, BackendAdapter
 ├── utils/
 │   ├── port.ts           # Read port from ./.port file
 │   ├── auth.ts           # Parse AWS Authorization header
 │   ├── xml.ts            # S3 XML response builders
 │   ├── errors.ts         # S3 error codes
+│   ├── connectionPool.ts # Per-server connection pooling + reuse
+│   ├── awsChunked.ts     # Decoder for aws-chunked (streaming SigV4) bodies
 │   └── encryption.ts     # Hybrid RSA+AES-256-GCM encrypt/decrypt
 ├── adapters/
 │   ├── base.ts           # Abstract BaseAdapter
@@ -237,14 +256,58 @@ tests/
 ├── auth.test.ts          # Auth header parsing unit tests
 ├── encryption.test.ts    # Encryption utility unit tests
 ├── ftp.test.ts           # FTP adapter integration tests
-└── sftp.test.ts          # SFTP adapter integration tests
+├── sftp.test.ts          # SFTP adapter integration tests
+├── http.test.ts          # Full S3 HTTP API over a real socket
+├── crypto-compat.test.ts # putfile-cloud byte-format compatibility
+└── streaming.test.ts     # aws-chunked, streaming crypto, memory bounds
 ```
+
+## Streaming
+
+Uploads and downloads are streamed end to end — request socket → optional
+`aws-chunked` decode → optional encryption → backend, and the reverse on read.
+Object bodies are never buffered, so memory does not scale with object size and
+the first byte reaches the client before the last byte leaves the backend.
+
+- `PutObject` bodies are piped straight to the backend. No body parser runs on
+  that route (one would buffer the object in memory and defeat the purpose).
+- `GetObject` issues a stat to set `Content-Length`, then streams the body.
+- **`Content-Encoding: aws-chunked` is decoded.** Clients that stream SigV4
+  uploads frame the body with per-chunk headers; that framing is transport-level
+  and is stripped, so the stored object is the payload alone.
+- Encryption streams too: the container's tag-last layout is produced in a
+  single pass, and decryption withholds the trailing 16 bytes to verify the tag.
+- SFTP transfers use a 256 KB window, which outperforms the 64 KB stream default
+  on high-latency links.
+
+Measured against a Hetzner Storage Box: a 256 MB object transferred in both
+directions with ~35 MB of peak RSS growth and a first byte after ~80 ms.
+
+> **Streaming AEAD caveat:** because AES-GCM's auth tag trails the ciphertext,
+> decrypted bytes are delivered before the tag can be verified. A corrupted or
+> tampered object fails *during* the transfer — the response is aborted rather
+> than completed — so a client must treat a failed transfer as untrusted and
+> discard what it received. Failures detected before the first byte (such as a
+> wrong key) still return a normal S3 error document.
 
 ## Limitations
 
 - No signature verification (trust-based, for local use)
-- Objects buffered in RAM (no streaming for very large files)
 - No multipart upload
 - No ACLs, versioning, or lifecycle policies
-- Flat directory listing only
+- No pagination — `ListObjects` returns the whole subtree in one response
+  (`MaxKeys` / `ContinuationToken` are ignored), so very large buckets produce
+  large responses.
+- No delimiter support: listings are always fully recursive and never return
+  `CommonPrefixes`.
 - Rsync: future extension (requires CLI wrapper)
+
+## Verified Against
+
+Live-tested end to end against a Hetzner Storage Box (SFTPGo 2.6.2 for FTP,
+OpenSSH 9.6 for SFTP/SCP) over all three protocols, plus the AWS SDK for
+JavaScript v3 as a real S3 client:
+
+- All eight S3 operations, text and binary payloads, nested keys
+- Transparent RSA+AES-256-GCM encryption round-trip (header-supplied keys)
+- Concurrent requests over pooled backend connections

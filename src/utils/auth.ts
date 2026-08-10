@@ -14,13 +14,42 @@ export interface ParsedAccessKey {
  * Header format:
  *   AWS4-HMAC-SHA256 Credential=<AccessKey>/<date>/<region>/<service>/aws4_request,
  *                   SignedHeaders=..., Signature=...
+ *
+ * Our access keys are URIs (`sftp://user@host:22`) and therefore contain
+ * slashes. Real AWS SDKs place the access key in the Credential field
+ * verbatim — they do NOT URL-encode it — so the key cannot be matched by
+ * "everything up to the first slash". Instead we take the whole Credential
+ * value and strip the credential scope, which is always exactly four
+ * trailing components: <date>/<region>/<service>/aws4_request.
+ *
+ * This accepts both the raw form (what AWS SDKs send) and the percent-encoded
+ * form (what a hand-rolled client might send).
  */
 export function extractAccessKey(authHeader: string): string {
-  const match = authHeader.match(/Credential=([^/\s,]+)/);
+  const match = authHeader.match(/Credential=([^,\s]+)/);
   if (!match) {
     throw new Error('Cannot parse Credential from Authorization header');
   }
-  return decodeURIComponent(match[1]);
+
+  const parts = match[1].split('/');
+  if (parts.length < 5 || parts[parts.length - 1] !== 'aws4_request') {
+    throw new Error(
+      'Malformed Credential: expected <AccessKey>/<date>/<region>/<service>/aws4_request',
+    );
+  }
+
+  const accessKey = parts.slice(0, -4).join('/');
+  if (!accessKey) {
+    throw new Error('Credential contains an empty Access Key');
+  }
+
+  // A raw URI decodes to itself; a percent-encoded one is restored here.
+  // Keys containing a literal '%' are not valid escape sequences — keep them as-is.
+  try {
+    return decodeURIComponent(accessKey);
+  } catch {
+    return accessKey;
+  }
 }
 
 /**

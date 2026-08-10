@@ -124,18 +124,20 @@ function setupSftpHandlers(sftp: SFTPWrapper, rootDir: string): void {
         if (flags & OPEN_MODE.TRUNC) nodeFlags = 'w';
       }
 
-      // Ensure parent directory exists for writes
-      if (nodeFlags !== 'r') {
-        const parentDir = join(absPath, '..');
-        mkdirSync(parentDir, { recursive: true });
-      }
-
+      // NOTE: parent directories are deliberately NOT auto-created. Real SFTP
+      // servers reject a write into a missing directory, and silently creating
+      // them here would hide adapter bugs with nested S3 keys (`a/b/c.txt`).
       const fd = openSync(absPath, nodeFlags);
       const handleId = nextHandle++;
       fileHandles.set(handleId, { path: absPath, fd, flags });
       sftp.handle(reqid, Buffer.from([handleId]));
     } catch (err) {
-      sftp.status(reqid, STATUS_CODE.FAILURE, String(err));
+      const code = (err as NodeJS.ErrnoException).code;
+      sftp.status(
+        reqid,
+        code === 'ENOENT' ? STATUS_CODE.NO_SUCH_FILE : STATUS_CODE.FAILURE,
+        String(err),
+      );
     }
   });
 

@@ -1,8 +1,11 @@
-import { Client } from 'basic-ftp';
+import { Client, FileType } from 'basic-ftp';
 import { createHash } from 'crypto';
-import { PassThrough, Readable } from 'stream';
+import { Readable, type Writable } from 'stream';
 import type { FileEntry, ObjectMeta } from '../types/backend.js';
 import { BaseAdapter } from './base.js';
+
+/** Safety net against pathological trees; real buckets are far shallower. */
+const MAX_LIST_DEPTH = 32;
 
 export class FtpAdapter extends BaseAdapter {
   private client = new Client();
@@ -24,35 +27,62 @@ export class FtpAdapter extends BaseAdapter {
     });
   }
 
+  /**
+   * Recursively collect every file under `dir`, keyed by its path relative to
+   * the bucket. S3 keys are flat strings containing slashes, so a shallow
+   * listing would hide every nested object.
+   */
+  private async walk(dir: string, keyPrefix: string, depth: number): Promise<FileEntry[]> {
+    if (depth > MAX_LIST_DEPTH) return [];
+
+    const list = await this.client.list(dir);
+    const entries: FileEntry[] = [];
+
+    for (const f of list) {
+      if (f.name === '.' || f.name === '..') continue;
+
+      const key = keyPrefix ? `${keyPrefix}/${f.name}` : f.name;
+
+      if (f.type === FileType.File) {
+        entries.push({
+          key,
+          size: f.size ?? 0,
+          lastModified: f.modifiedAt ?? new Date(),
+          etag: createHash('md5').update(`${f.name}${f.size ?? 0}`).digest('hex'),
+        });
+      } else if (f.type === FileType.Directory) {
+        // Symlinks are not followed — they can form cycles.
+        entries.push(...await this.walk(`${dir}/${f.name}`, key, depth + 1));
+      }
+    }
+
+    return entries;
+  }
+
   async listObjects(prefix = ''): Promise<FileEntry[]> {
     const dir = prefix ? this.remotePath(prefix) : this.remotePath();
-    const list = await this.client.list(dir);
-    return list
-      .filter(f => f.type === 1) // type 1 = file
-      .map(f => ({
-        key: prefix ? `${prefix}/${f.name}` : f.name,
-        size: f.size ?? 0,
-        lastModified: f.modifiedAt ?? new Date(),
-        etag: createHash('md5').update(`${f.name}${f.size ?? 0}`).digest('hex'),
-      }));
+    return this.walk(dir, prefix, 0);
   }
 
-  async getObject(key: string): Promise<Buffer> {
-    const pass = new PassThrough();
-    const chunks: Buffer[] = [];
-    pass.on('data', (chunk: Buffer) => chunks.push(chunk));
-    const done = new Promise<void>((resolve, reject) => {
-      pass.on('end', resolve);
-      pass.on('error', reject);
-    });
-    await this.client.downloadTo(pass, this.remotePath(key));
-    await done;
-    return Buffer.concat(chunks);
+  /**
+   * Streams the remote file straight into `dest`. basic-ftp pipes the data
+   * socket to the destination, so nothing is buffered and the promise resolves
+   * only once the transfer completes (which is what keeps the pooled
+   * connection checked out for the whole transfer).
+   */
+  async downloadTo(key: string, dest: Writable): Promise<void> {
+    await this.client.downloadTo(dest, this.remotePath(key));
   }
 
-  async putObject(key: string, data: Buffer): Promise<void> {
-    const readable = Readable.from(data);
-    await this.client.uploadFrom(readable, this.remotePath(key));
+  /** Streams `src` straight to the remote file — nothing is buffered. */
+  async uploadFrom(key: string, src: Readable): Promise<void> {
+    // S3 keys are flat strings: `a/b/c.txt` implies directories that FTP will
+    // not create on its own, so materialise them before uploading.
+    const full = this.remotePath(key);
+    if (key.includes('/')) {
+      await this.client.ensureDir(full.slice(0, full.lastIndexOf('/')));
+    }
+    await this.client.uploadFrom(src, full);
   }
 
   async deleteObject(key: string): Promise<void> {
@@ -66,7 +96,7 @@ export class FtpAdapter extends BaseAdapter {
     const parentDir = parts.length > 0 ? this.remotePath(parts.join('/')) : this.remotePath();
     const list = await this.client.list(parentDir);
     const f = list.find(item => item.name === filename);
-    if (!f || f.type !== 1) {
+    if (!f || f.type !== FileType.File) {
       throw Object.assign(new Error('NoSuchKey'), { code: 'NoSuchKey' });
     }
     return {

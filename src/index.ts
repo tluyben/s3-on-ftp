@@ -1,40 +1,16 @@
-import express from 'express';
-import cors from 'cors';
 import { readPort } from './utils/port.js';
 import { isEncryptionEnabled, getEncryptionConfig } from './utils/encryption.js';
-import s3Router from './routes/s3.js';
+import { createApp } from './app.js';
 
-const app = express();
+const app = createApp();
 const PORT = readPort();
 
-// CORS
-app.use(cors());
-
-// Raw body for object uploads — must precede json middleware
-// Handles PUT /:bucket/:key (PutObject)
-app.use((req, res, next) => {
-  if (req.method === 'PUT' && req.path.split('/').length > 2) {
-    express.raw({ type: '*/*', limit: '5gb' })(req, res, next);
-  } else {
-    next();
-  }
+// Last-resort guard. Request handling settles its own streaming promises, but a
+// proxy must not die because one transfer failed in an unforeseen way — Node's
+// default action for an unhandled rejection is to terminate the process.
+process.on('unhandledRejection', reason => {
+  console.error('[s3-proxy] unhandled rejection (request aborted, server continuing):', reason);
 });
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// Health check
-app.get('/health', (_req, res) => {
-  res.json({
-    status: 'healthy',
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    service: 's3-protocol-proxy',
-  });
-});
-
-// S3-compatible API
-app.use('/', s3Router);
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {

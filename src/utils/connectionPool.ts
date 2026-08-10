@@ -17,6 +17,7 @@ interface ServerPool {
   entries: PoolEntry[];
   maxSize: number;
   waiters: Array<(entry: PoolEntry) => void>;
+  keepaliveTimer?: NodeJS.Timeout;
 }
 
 type BaseCreds = Omit<BackendCredentials, 'bucket'>;
@@ -47,7 +48,7 @@ function isAlive(adapter: BaseAdapter): boolean {
 }
 
 function startFtpKeepalive(pool: ServerPool): void {
-  const timer = setInterval(() => {
+  const timer = pool.keepaliveTimer = setInterval(() => {
     for (const entry of pool.entries) {
       if (!entry.busy && entry.adapter instanceof FtpAdapter) {
         void entry.adapter.keepAlive().catch(() => {
@@ -96,6 +97,27 @@ function makeHandle(pool: ServerPool, entry: PoolEntry): { adapter: BaseAdapter;
       }
     },
   };
+}
+
+/**
+ * Disconnect every pooled connection and reset the pools.
+ *
+ * Pooled sockets keep the event loop alive, so without this a process (or a
+ * test run) cannot shut down cleanly once any backend has been contacted.
+ */
+export async function closeAllPools(): Promise<void> {
+  const all = [...pools.values()];
+  pools.clear();
+  baseCreds.clear();
+
+  await Promise.all(
+    all.flatMap(pool => {
+      if (pool.keepaliveTimer) clearInterval(pool.keepaliveTimer);
+      return pool.entries.map(entry =>
+        entry.adapter.disconnect().catch(() => { /* already gone */ }),
+      );
+    }),
+  );
 }
 
 export async function acquireConnection(creds: BackendCredentials): Promise<{ adapter: BaseAdapter; release: () => void }> {

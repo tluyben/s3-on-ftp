@@ -1,3 +1,4 @@
+import { Readable, Writable } from 'stream';
 import type { BackendAdapter, BackendCredentials, FileEntry, ObjectMeta } from '../types/backend.js';
 
 export abstract class BaseAdapter implements BackendAdapter {
@@ -9,8 +10,30 @@ export abstract class BaseAdapter implements BackendAdapter {
     this.creds = { ...this.creds, bucket };
   }
   abstract listObjects(prefix?: string): Promise<FileEntry[]>;
-  abstract getObject(key: string): Promise<Buffer>;
-  abstract putObject(key: string, data: Buffer): Promise<void>;
+  abstract downloadTo(key: string, dest: Writable): Promise<void>;
+  abstract uploadFrom(key: string, src: Readable): Promise<void>;
+
+  /**
+   * Buffered helpers for callers that genuinely want the whole object in
+   * memory (tests, small internal reads). The request path never uses these —
+   * it streams — so object size stays independent of available RAM.
+   */
+  async getObject(key: string): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    const sink = new Writable({
+      write(chunk: Buffer, _enc, cb) {
+        chunks.push(Buffer.from(chunk));
+        cb();
+      },
+    });
+    await this.downloadTo(key, sink);
+    return Buffer.concat(chunks);
+  }
+
+  async putObject(key: string, data: Buffer): Promise<void> {
+    await this.uploadFrom(key, Readable.from(data));
+  }
+
   abstract deleteObject(key: string): Promise<void>;
   abstract headObject(key: string): Promise<ObjectMeta>;
   abstract bucketExists(): Promise<boolean>;
